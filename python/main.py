@@ -2,46 +2,30 @@ import os
 import re
 import shutil
 import uuid
+import traceback
 import pytesseract
 import uvicorn
-import traceback
 
 from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pdf2image import convert_from_path
 
-# ---------------- SERVICES ----------------
-
-from services.qa_llm import answer_question
-from services.llm import call_llm
-from services.excel_writer import json_to_excel
-from services.chunker import split_text
-from services.store import store_user, store_document, store_chunk
-from services.search import search_chunks
-
-# ---------------- FEATURE FLAGS ----------------
-
-ENABLE_OCR = os.getenv("ENABLE_OCR", "true").lower() == "true"
-
-# ---------------- OCR CONFIG ----------------
-
-print("TESSERACT PATH:", shutil.which("tesseract"))
-print("PDFINFO PATH:", shutil.which("pdfinfo"))
-
-# ---------------- STORAGE ----------------
+# ================== BASIC SETUP ==================
 
 BASE_DIR = "uploads"
 PDF_DIR = os.path.join(BASE_DIR, "pdfs")
 
 os.makedirs(PDF_DIR, exist_ok=True)
-os.makedirs("static", exist_ok=True)
 
-# ---------------- APP ----------------
+ENABLE_OCR = True
+
+print("TESSERACT:", shutil.which("tesseract"))
+print("PDFINFO:", shutil.which("pdfinfo"))
+
+# ================== APP ==================
 
 app = FastAPI(title="Img2XL Backend")
 
@@ -53,150 +37,106 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ================== MEMORY STORE ==================
 
-# ---------------- HOME ----------------
+DOCUMENT_TEXT = ""
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return FileResponse("static/index.html")
+# ================== MODELS ==================
 
-# ---------------- HELPERS ----------------
+class AskRequest(BaseModel):
+    question: str
+
+# ================== HELPERS ==================
 
 def analyze_text(text: str):
     return {
-        "application_numbers": re.findall(r"\b\d{10,}\b", text),
-        "ip_addresses": re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text),
-        "dates": re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}-\d{2}-\d{4}\b", text),
-        "times": re.findall(r"\b\d{2}:\d{2}(?::\d{2})?\b", text)
+        "numbers": re.findall(r"\b\d+\b", text),
+        "dates": re.findall(r"\b\d{2}-\d{2}-\d{4}\b", text),
+        "emails": re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
     }
 
-def summarize_analysis(analysis: List[dict]):
-    return {
-        "pages_scanned": len(analysis),
-        "ocr_success_pages": [p["page"] for p in analysis if p["ocr_status"] == "success"]
-    }
+def split_text(text, size=1000):
+    return [text[i:i+size] for i in range(0, len(text), size)]
 
-# ---------------- UPLOAD ----------------
+# ================== HOME ==================
+
+@app.get("/")
+def home():
+    return {"status": "running"}
+
+# ================== UPLOAD ==================
 
 @app.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
     use_ocr: bool = Form(True)
 ):
+    global DOCUMENT_TEXT
 
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF allowed")
 
     doc_id = str(uuid.uuid4())
     pdf_path = os.path.join(PDF_DIR, f"{doc_id}.pdf")
 
     try:
-        # Save file
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
         reader = PdfReader(pdf_path)
-        analysis = []
-
-        ocr_allowed = ENABLE_OCR and use_ocr
+        pages_text = []
 
         for i, page in enumerate(reader.pages):
-
             text_layer = page.extract_text() or ""
-            ocr_text = ""
-            ocr_status = "skipped"
 
-            if ocr_allowed:
+            ocr_text = ""
+            if ENABLE_OCR and use_ocr:
                 try:
                     images = convert_from_path(
                         pdf_path,
                         first_page=i + 1,
                         last_page=i + 1
                     )
+                    ocr_text = pytesseract.image_to_string(images[0])
+                except:
+                    pass
 
-                    ocr_text = pytesseract.image_to_string(
-                        images[0],
-                        lang="eng",
-                        config="--oem 3 --psm 6"
-                    )
+            combined = f"{text_layer}\n{ocr_text}"
+            pages_text.append(combined)
 
-                    ocr_status = "success"
-                    print(f"\n--- PAGE {i+1} OCR SAMPLE ---\n", ocr_text[:200])
-
-                except Exception as ocr_error:
-                    print("OCR ERROR:", ocr_error)
-                    ocr_status = "failed"
-
-            combined_text = f"""
-{text_layer}
-
------ OCR TEXT -----
-{ocr_text}
-""".strip()
-
-            analysis.append({
-                "page": i + 1,
-                "ocr_status": ocr_status,
-                "combined_text": combined_text,
-                "details": analyze_text(combined_text)
-            })
-
-        summary = summarize_analysis(analysis)
-        full_text = "\n".join(p["combined_text"] for p in analysis)
-
-        # Store
-        user_id = store_user("demo@img2xl.com")
-        doc_db_id = store_document(user_id, file.filename)
-
-        chunks = split_text(full_text)
-
-        for c in chunks:
-            store_chunk(doc_db_id, c)
+        DOCUMENT_TEXT = "\n".join(pages_text)
 
         return {
-            "document_id": doc_id,
+            "status": "ok",
             "filename": file.filename,
             "pages": len(reader.pages),
-            "summary": summary,
-            "ocr_enabled": ocr_allowed,
-            "stored_in_database": True
+            "characters": len(DOCUMENT_TEXT)
         }
 
     except Exception as e:
-        print("UPLOAD FAILED:", str(e))
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Upload processing failed")
+        raise HTTPException(status_code=500, detail="Upload failed")
 
-# ---------------- ASK ----------------
-
-class AskRequest(BaseModel):
-    question: str
+# ================== ASK ==================
 
 @app.post("/ask")
 async def ask_question(payload: AskRequest):
 
-    try:
-        results = search_chunks(payload.question)
+    if not DOCUMENT_TEXT:
+        return {"answer": "Upload document first"}
 
-        if not results:
-            return {"answer": "No relevant data found in document."}
+    chunks = split_text(DOCUMENT_TEXT)
 
-        context = "\n".join(r["chunk_text"] for r in results)
+    context = chunks[0]  # simple first chunk
 
-        answer = answer_question(context, payload.question)
+    return {
+        "answer": f"Question received: {payload.question}",
+        "sources": [
+            {"chunk_text": context[:500]}
+        ]
+    }
 
-        return {
-            "answer": answer,
-            "sources": results,
-            "total_sources": len(results)
-        }
-
-    except Exception as e:
-        print("ASK ERROR:", e)
-        return {"answer": "AI service temporarily unavailable."}
-
-# ---------------- RUN ----------------
+# ================== RUN ==================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
