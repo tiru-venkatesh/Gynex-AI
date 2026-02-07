@@ -1,7 +1,7 @@
-import { API_BASE_URL } from "./config";
+const AI_BASE_URL = import.meta.env.VITE_AI_URL;
 
 export async function askQuestion(question: string) {
-  const res = await fetch(`${API_BASE_URL}/ask`, {
+  const res = await fetch(`${AI_BASE_URL}/ask`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
