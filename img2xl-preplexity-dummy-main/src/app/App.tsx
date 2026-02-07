@@ -4,18 +4,8 @@ import { MainContent } from './components/MainContent';
 import { Thread } from './components/Thread';
 import { ThemeProvider } from 'next-themes';
 import { Menu } from 'lucide-react';
-import { useAuth } from "../auth/AuthContext";
-import Login from "../pages/Login";
-
 
 export default function App() {
-
-  const { token } = useAuth();   // ✅ first
-
-  // ✅ Auth Guard
-  if (!token) {
-    return <Login />;
-  }
 
   const [activeThread, setActiveThread] = useState<string | null>(null);
   const [query, setQuery] = useState('');
