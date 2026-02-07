@@ -1,10 +1,11 @@
+from google.genai import Client
+import os
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
-from google.genai import Client
 import os, uuid
 import numpy as np
 import faiss
