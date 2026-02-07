@@ -6,4 +6,5 @@ pillow
 faiss-cpu
 numpy
 fastapi
+pypdf
 uvicorn
