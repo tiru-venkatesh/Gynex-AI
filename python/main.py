@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
-import google.generativeai as genai
+import google.genai as genai
 import os, uuid
 import numpy as np
 import faiss
