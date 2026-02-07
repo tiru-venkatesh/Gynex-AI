@@ -25,7 +25,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gynex-iqyrnni42-tiru-venkateshs-projects.vercel.app"],
+    allow_origins=["*"],   # allow all websites
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
