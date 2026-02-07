@@ -6,7 +6,7 @@ export async function uploadPDF(file: File) {
 
   const res = await fetch(`${AI_BASE_URL}/upload`, {
     method: "POST",
-    body: formData
+    body: formData,
   });
 
   if (!res.ok) throw new Error("Upload failed");
