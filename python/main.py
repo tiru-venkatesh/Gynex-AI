@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
-import google.genai as genai
+from google import genai
 import os, uuid
 import numpy as np
 import faiss
@@ -14,10 +14,8 @@ import faiss
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Gemini API from environment (SAFE)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-llm = genai.GenerativeModel("gemini-1.5-flash")
+# Gemini Client
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ============================ APP ============================
 
@@ -25,12 +23,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # allow all websites
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ============================ MEMORY ============================
 
@@ -55,11 +52,11 @@ def chunk_text(text, size=800, overlap=200):
 
 
 def embed(text):
-    result = genai.embed_content(
-        model="models/embedding-001",
-        content=text
+    result = client.models.embed_content(
+        model="text-embedding-004",
+        contents=text
     )
-    return np.array(result["embedding"], dtype="float32")
+    return np.array(result.embeddings[0].values, dtype="float32")
 
 
 def clean_text(text):
@@ -134,7 +131,10 @@ QUESTION:
 {req.question}
 """
 
-    response = llm.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=prompt
+    )
 
     return {
         "answer": response.text,
