@@ -10,5 +10,6 @@ export async function uploadPDF(file: File) {
   });
 
   if (!res.ok) throw new Error("Upload failed");
+
   return res.json();
 }
