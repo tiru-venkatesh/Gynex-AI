@@ -5,21 +5,17 @@ from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
 import google.generativeai as genai
-import os
-import uuid
+import os, uuid
 import numpy as np
 import faiss
 
 # ============================ CONFIG ============================
 
-POPPLER_PATH = r"C:\poppler\Library\bin"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-GEMINI_API_KEY = "AIzaSyAh6JKmksC2F_PjmXo_Fe5ZVSoB0PaXu6I"
-genai.configure(api_key=GEMINI_API_KEY)
+# Gemini API from environment (SAFE)
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 llm = genai.GenerativeModel("gemini-1.5-flash")
 
@@ -39,7 +35,6 @@ app.add_middleware(
 DOCUMENT_TEXT = ""
 CHUNKS = []
 INDEX = None
-EMBEDDING_DIM = None
 
 # ============================ MODELS ============================
 
@@ -66,13 +61,13 @@ def embed(text):
 
 
 def clean_text(text):
-    return text.replace("\x00", "").replace("\n\n", "\n").strip()
+    return text.replace("\x00", "").strip()
 
 # ============================ UPLOAD ============================
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    global DOCUMENT_TEXT, CHUNKS, INDEX, EMBEDDING_DIM
+    global DOCUMENT_TEXT, CHUNKS, INDEX
 
     filename = f"{uuid.uuid4()}_{file.filename}"
     path = os.path.join(UPLOAD_DIR, filename)
@@ -82,15 +77,15 @@ async def upload(file: UploadFile = File(...)):
 
     text = ""
 
-    # ----------- PDF ----------
+    # PDF → OCR
     if file.filename.lower().endswith(".pdf"):
-        images = convert_from_path(path, poppler_path=POPPLER_PATH)
+        images = convert_from_path(path)
         for img in images:
             text += pytesseract.image_to_string(img)
 
-    # ----------- IMAGE ----------
+    # IMAGE → OCR
     else:
-        img = Image.open(path).convert("L")
+        img = Image.open(path)
         text = pytesseract.image_to_string(img)
 
     text = clean_text(text)
@@ -102,9 +97,9 @@ async def upload(file: UploadFile = File(...)):
     CHUNKS = chunk_text(text)
 
     vectors = [embed(c) for c in CHUNKS]
-    EMBEDDING_DIM = len(vectors[0])
+    dim = len(vectors[0])
 
-    INDEX = faiss.IndexFlatL2(EMBEDDING_DIM)
+    INDEX = faiss.IndexFlatL2(dim)
     INDEX.add(np.array(vectors))
 
     return {
@@ -119,7 +114,7 @@ async def upload(file: UploadFile = File(...)):
 def ask(req: AskRequest):
 
     if INDEX is None:
-        return {"error": "Upload a document first"}
+        return {"error": "Upload document first"}
 
     q_vec = embed(req.question)
     _, I = INDEX.search(np.array([q_vec]), 3)
@@ -128,8 +123,6 @@ def ask(req: AskRequest):
     context = "\n\n".join(sources)
 
     prompt = f"""
-You are a document assistant.
-
 Answer ONLY from context.
 
 CONTEXT:
