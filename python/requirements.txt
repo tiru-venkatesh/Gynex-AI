@@ -7,3 +7,4 @@ pdf2image
 google-genai
 faiss-cpu
 numpy
+python-multipart
