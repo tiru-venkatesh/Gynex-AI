@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
-from google import genai
+from google.genai import Client
 import os, uuid
 import numpy as np
 import faiss
@@ -15,7 +15,7 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Gemini Client
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ============================ APP ============================
 
