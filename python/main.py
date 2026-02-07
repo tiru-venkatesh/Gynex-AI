@@ -1,28 +1,49 @@
-from google.genai import Client
-import os, uuid
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-from pdf2image import convert_from_path
-from PIL import Image
+import os
+import re
+import shutil
+import uuid
 import pytesseract
+import uvicorn
+import traceback
 
-import numpy as np
-import faiss
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from pypdf import PdfReader
+from pdf2image import convert_from_path
 
-# ============================ CONFIG ============================
+# ---------------- SERVICES ----------------
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+from services.qa_llm import answer_question
+from services.llm import call_llm
+from services.excel_writer import json_to_excel
+from services.chunker import split_text
+from services.store import store_user, store_document, store_chunk
+from services.search import search_chunks
 
-# Gemini Client
-client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+# ---------------- FEATURE FLAGS ----------------
 
-# ============================ APP ============================
+ENABLE_OCR = os.getenv("ENABLE_OCR", "true").lower() == "true"
 
-app = FastAPI()
+# ---------------- OCR CONFIG ----------------
+
+print("TESSERACT PATH:", shutil.which("tesseract"))
+print("PDFINFO PATH:", shutil.which("pdfinfo"))
+
+# ---------------- STORAGE ----------------
+
+BASE_DIR = "uploads"
+PDF_DIR = os.path.join(BASE_DIR, "pdfs")
+
+os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs("static", exist_ok=True)
+
+# ---------------- APP ----------------
+
+app = FastAPI(title="Img2XL Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,121 +53,151 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================ MEMORY ============================
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-DOCUMENT_TEXT = ""
-CHUNKS = []
-INDEX = None
+# ---------------- HOME ----------------
 
-# ============================ MODELS ============================
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return FileResponse("static/index.html")
+
+# ---------------- HELPERS ----------------
+
+def analyze_text(text: str):
+    return {
+        "application_numbers": re.findall(r"\b\d{10,}\b", text),
+        "ip_addresses": re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text),
+        "dates": re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}-\d{2}-\d{4}\b", text),
+        "times": re.findall(r"\b\d{2}:\d{2}(?::\d{2})?\b", text)
+    }
+
+def summarize_analysis(analysis: List[dict]):
+    return {
+        "pages_scanned": len(analysis),
+        "ocr_success_pages": [p["page"] for p in analysis if p["ocr_status"] == "success"]
+    }
+
+# ---------------- UPLOAD ----------------
+
+@app.post("/upload")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    use_ocr: bool = Form(True)
+):
+
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+
+    doc_id = str(uuid.uuid4())
+    pdf_path = os.path.join(PDF_DIR, f"{doc_id}.pdf")
+
+    try:
+        # Save file
+        with open(pdf_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        reader = PdfReader(pdf_path)
+        analysis = []
+
+        ocr_allowed = ENABLE_OCR and use_ocr
+
+        for i, page in enumerate(reader.pages):
+
+            text_layer = page.extract_text() or ""
+            ocr_text = ""
+            ocr_status = "skipped"
+
+            if ocr_allowed:
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=i + 1,
+                        last_page=i + 1
+                    )
+
+                    ocr_text = pytesseract.image_to_string(
+                        images[0],
+                        lang="eng",
+                        config="--oem 3 --psm 6"
+                    )
+
+                    ocr_status = "success"
+                    print(f"\n--- PAGE {i+1} OCR SAMPLE ---\n", ocr_text[:200])
+
+                except Exception as ocr_error:
+                    print("OCR ERROR:", ocr_error)
+                    ocr_status = "failed"
+
+            combined_text = f"""
+{text_layer}
+
+----- OCR TEXT -----
+{ocr_text}
+""".strip()
+
+            analysis.append({
+                "page": i + 1,
+                "ocr_status": ocr_status,
+                "combined_text": combined_text,
+                "details": analyze_text(combined_text)
+            })
+
+        summary = summarize_analysis(analysis)
+        full_text = "\n".join(p["combined_text"] for p in analysis)
+
+        # Store
+        user_id = store_user("demo@img2xl.com")
+        doc_db_id = store_document(user_id, file.filename)
+
+        chunks = split_text(full_text)
+
+        for c in chunks:
+            store_chunk(doc_db_id, c)
+
+        return {
+            "document_id": doc_id,
+            "filename": file.filename,
+            "pages": len(reader.pages),
+            "summary": summary,
+            "ocr_enabled": ocr_allowed,
+            "stored_in_database": True
+        }
+
+    except Exception as e:
+        print("UPLOAD FAILED:", str(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Upload processing failed")
+
+# ---------------- ASK ----------------
 
 class AskRequest(BaseModel):
     question: str
 
-# ============================ HELPERS ============================
-
-def chunk_text(text, size=800, overlap=200):
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i+size])
-        i += size - overlap
-    return chunks
-
-
-def embed(text):
-    result = client.models.embed_content(
-        model="text-embedding-004",
-        contents=text
-    )
-    return np.array(result.embeddings[0].values, dtype="float32")
-
-
-def clean_text(text):
-    return text.replace("\x00", "").strip()
-
-# ============================ UPLOAD ============================
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    global DOCUMENT_TEXT, CHUNKS, INDEX
-
-    filename = f"{uuid.uuid4()}_{file.filename}"
-    path = os.path.join(UPLOAD_DIR, filename)
-
-    with open(path, "wb") as f:
-        f.write(await file.read())
-
-    text = ""
-
-    # PDF → OCR
-    if file.filename.lower().endswith(".pdf"):
-        images = convert_from_path(path)
-        for img in images:
-            text += pytesseract.image_to_string(img)
-
-    # IMAGE → OCR
-    else:
-        img = Image.open(path)
-        text = pytesseract.image_to_string(img)
-
-    text = clean_text(text)
-
-    if not text:
-        return {"status": "error", "message": "No text extracted"}
-
-    DOCUMENT_TEXT = text
-    CHUNKS = chunk_text(text)
-
-    vectors = [embed(c) for c in CHUNKS]
-    dim = len(vectors[0])
-
-    INDEX = faiss.IndexFlatL2(dim)
-    INDEX.add(np.array(vectors))
-
-    return {
-        "status": "ok",
-        "chunks": len(CHUNKS),
-        "characters": len(text)
-    }
-
-# ============================ ASK ============================
-
 @app.post("/ask")
-def ask(req: AskRequest):
+async def ask_question(payload: AskRequest):
 
-    if INDEX is None:
-        return {"error": "Upload document first"}
+    try:
+        results = search_chunks(payload.question)
 
-    q_vec = embed(req.question)
-    _, I = INDEX.search(np.array([q_vec]), 3)
+        if not results:
+            return {"answer": "No relevant data found in document."}
 
-    sources = [CHUNKS[i] for i in I[0]]
-    context = "\n\n".join(sources)
+        context = "\n".join(r["chunk_text"] for r in results)
 
-    prompt = f"""
-Answer ONLY from context.
+        answer = answer_question(context, payload.question)
 
-CONTEXT:
-{context}
+        return {
+            "answer": answer,
+            "sources": results,
+            "total_sources": len(results)
+        }
 
-QUESTION:
-{req.question}
-"""
+    except Exception as e:
+        print("ASK ERROR:", e)
+        return {"answer": "AI service temporarily unavailable."}
 
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=prompt
-    )
+# ---------------- RUN ----------------
 
-    return {
-        "answer": response.text,
-        "sources": [{"chunk_text": s} for s in sources],
-        "ocr_text": DOCUMENT_TEXT[:2000]
-    }
-
-# ============================ ROOT ============================
-
-@app.get("/")
-def root():
-    return {"status": "running"}
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
