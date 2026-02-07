@@ -1,10 +1,9 @@
-fastapi
-uvicorn
-pydantic
-pytesseract
-pillow
-pdf2image
+python-multipart
 google-genai
+pytesseract
+pdf2image
+pillow
 faiss-cpu
 numpy
-python-multipart
+fastapi
+uvicorn
